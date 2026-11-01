@@ -36,6 +36,13 @@ REPO="$(pwd)"
 . ./config.sh
 : "${AMIX_SYSROOT:?set AMIX_SYSROOT in config.sh}"
 [ -d "$AMIX_SYSROOT/usr/include" ] || { echo "build-cross.sh: no headers in $AMIX_SYSROOT/usr/include" >&2; exit 1; }
+# SVR4.0 has no <stdint.h>, and GCC's own one for this target #include_next's
+# the C library's, so without ours in the sysroot even <cstdint> fails and
+# libstdc++ stops late in the build.  Checked here, before the long part.
+[ -f "$AMIX_SYSROOT/usr/include/stdint.h" ] || {
+	echo "build-cross.sh: no $AMIX_SYSROOT/usr/include/stdint.h -- copy compat/include/stdint.h there (tools/sync-sysroot.sh does this too)" >&2
+	exit 1
+}
 
 TARGET=m68k-elf
 TC_PREFIX="${TC_PREFIX:-$HOME/opt/m68k-amix}"
@@ -57,14 +64,29 @@ fetch() {  # $1 = url, $2 = filename
 	[ -f "$WORK/src/$2" ] && return 0
 	echo "== fetching $2"
 	curl -fL --retry 3 -o "$WORK/src/$2.part" "$1"
-	mv "$WORK/src/$2.part" "$WORK/src/$2"
+	mv "${WORK:?}/src/$2.part" "${WORK:?}/src/$2"
 }
 
 # ---------------------------------------------------------------- binutils ---
-if [ ! -x "$TC_PREFIX/bin/$TARGET-ld" ]; then
+# toolchain/patches/binutils-*.patch are applied to the release, in name order.
+# binutils-pic-global-relocs.patch: m68k-elf gas turned a relocation against a
+# global symbol defined in the same file into one against its section, even in
+# -fPIC code, so a shared library's pointer to its own exported object could
+# not be redirected to an executable's R_68K_COPY of it.  See docs/TOOLCHAIN.md,
+# "A library's pointers to its own exported data".
+#
+# Done means built with the current patches: a prefix whose binutils predate a
+# patch is rebuilt, as the compiler is for amix-abi.h below.
+BINUTILS_STAMP="$TC_PREFIX/.binutils-patches.sha256"
+BINUTILS_SUM=$(cat "$REPO"/toolchain/patches/binutils-*.patch | sha256sum | cut -d' ' -f1)
+if [ ! -x "$TC_PREFIX/bin/$TARGET-ld" ] || [ "$(cat "$BINUTILS_STAMP" 2>/dev/null)" != "$BINUTILS_SUM" ]; then
 	fetch "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz" "binutils-$BINUTILS_VER.tar.xz"
-	rm -rf "$WORK/binutils-$BINUTILS_VER" "$WORK/build-binutils"
+	rm -rf "${WORK:?}/binutils-${BINUTILS_VER:?}" "${WORK:?}/build-binutils"
 	tar -C "$WORK" -xf "$WORK/src/binutils-$BINUTILS_VER.tar.xz"
+	for p in "$REPO"/toolchain/patches/binutils-*.patch; do
+		echo "== applying $(basename "$p")"
+		patch -d "$WORK/binutils-$BINUTILS_VER" -p1 --forward < "$p"
+	done
 	mkdir -p "$WORK/build-binutils"
 	cd "$WORK/build-binutils"
 	"$WORK/binutils-$BINUTILS_VER/configure" \
@@ -76,7 +98,8 @@ if [ ! -x "$TC_PREFIX/bin/$TARGET-ld" ]; then
 	make install MAKEINFO=true
 	cd "$WORK"
 	# Reclaim the space before GCC needs it.
-	rm -rf "$WORK/build-binutils" "$WORK/binutils-$BINUTILS_VER"
+	rm -rf "${WORK:?}/build-binutils" "${WORK:?}/binutils-${BINUTILS_VER:?}"
+	echo "$BINUTILS_SUM" > "$BINUTILS_STAMP"
 	echo "== binutils installed"
 fi
 
@@ -112,7 +135,7 @@ if [ ! -f "$TC_PREFIX/$TARGET/lib/libstdc++.a" ] || [ "$(cat "$ABI_STAMP" 2>/dev
 	python3 "$REPO/toolchain/patch-libstdcxx-configure.py" \
 		"$WORK/gcc-$GCC_VER/libstdc++-v3/configure" "$AMIX_SYSROOT"
 
-	rm -rf "$WORK/build-gcc"; mkdir -p "$WORK/build-gcc"
+	rm -rf "${WORK:?}/build-gcc"; mkdir -p "$WORK/build-gcc"
 	cd "$WORK/build-gcc"
 	# --disable-gcov: libgcov wants MAP_ANONYMOUS and intptr_t, and SVR4.0 has
 	#   neither.  Coverage instrumentation is not something this port needs, and
@@ -122,17 +145,21 @@ if [ ! -f "$TC_PREFIX/$TARGET/lib/libstdc++.a" ] || [ "$(cat "$ABI_STAMP" 2>/dev
 	#   own libstdc++; on a host with a few gigabytes free that fills the disk
 	#   before the build finishes.  One library serves the whole 68020..68060
 	#   range, which is every machine this port targets.
-	# --with-cpu=68060: NOT a performance choice, a correctness one.  libgcc's
-	#   __udivmoddi4 compiled for a 68020 uses divul / divull / mulul -- the
-	#   32x64 divide and 64-bit multiply forms the 68060 REMOVED.  On the target
-	#   machine, a 68060, they trap as unimplemented integer instructions, and
-	#   with no ISP handler in the kernel the process dies with SIGKILL.
-	#   Measured: any 64-bit divide by a NON-CONSTANT killed the process, while
-	#   dividing by a constant was fine because GCC folds that into a multiply
-	#   and never calls libgcc -- which is what made it look like a bug in the
-	#   caller.  Telling GCC the CPU is a 68060 makes it avoid those
-	#   instructions everywhere, libgcc included, and the result still runs on
-	#   68020/030/040 because it only ever avoids instructions, never adds any.
+	# --with-cpu=m68020-60: NOT a performance choice, a correctness one, in two
+	#   directions.  libgcc's __udivmoddi4 compiled for a plain 68020 uses
+	#   divul / divull / mulul -- the 32x64 divide and 64-bit multiply forms the
+	#   68060 REMOVED -- and with no ISP handler in the kernel the process dies
+	#   with SIGKILL.  Measured: any 64-bit divide by a NON-CONSTANT killed it,
+	#   while dividing by a constant was fine because GCC folds that into a
+	#   multiply and never calls libgcc.  Tuning for the 68060 avoids them.
+	#   But --with-cpu=68060 also makes the 68060 the ARCHITECTURE, and then
+	#   GCC uses the 68040/060-only FPU forms (fdmove, fsadd, fdmul...), which a
+	#   68881/68882 does not have: libgcc.a had 491 of them, libstdc++.a 123, and
+	#   on a 68030 + 68882 the first one kills the process with SIGSYS.  The
+	#   m68020-60 form is the 68020 instruction set and 68881 FPU tuned for the
+	#   whole range, so the runtime runs on every one of them.  (The "m" is
+	#   required: config.gcc only knows this name with it.)  -m68060 remains
+	#   available for code that will only ever run on a 68060.
 	#   This has to be the compiler DEFAULT: passing CFLAGS_FOR_TARGET does not
 	#   reach libgcc's own compile (measured -- the instructions survived).
 	# libstdc++ is built HOSTED -- containers, strings, the lot -- which is why
@@ -148,7 +175,7 @@ if [ ! -f "$TC_PREFIX/$TARGET/lib/libstdc++.a" ] || [ "$(cat "$ABI_STAMP" 2>/dev
 		--disable-libstdcxx-filesystem-ts --disable-libstdcxx-pch \
 		--disable-libstdcxx-backtrace \
 		--disable-multilib --disable-gcov \
-		--with-cpu=68060
+		--with-cpu=m68020-60
 	make -j"$JOBS" MAKEINFO=true all-gcc
 	make install-gcc MAKEINFO=true
 
@@ -194,6 +221,45 @@ if [ ! -f "$TC_PREFIX/$TARGET/lib/libstdc++.a" ] || [ "$(cat "$ABI_STAMP" 2>/dev
 	echo "$ABI_SUM" > "$ABI_STAMP"
 	echo "== gcc installed"
 fi
+
+# ---------------------------------------------------------- shared objects ---
+# gcc -shared links crtbeginS.o and crtendS.o, the PIC builds of crtbegin.o and
+# crtend.o.  m68k-elf's libgcc does not make them -- in GCC's view the target
+# has no shared libraries -- but its Makefile has the rules, and -fPIC is all
+# the S variants add on targets that do build them.  This is outside the block
+# above so that a toolchain built before it gets them without a rebuild, and
+# the specs and compat objects are brought up to date for the same reason.
+GCCLIB="$TC_PREFIX/lib/gcc/$TARGET/$("$TC_PREFIX/bin/$TARGET-gcc" -dumpversion)"
+if [ ! -f "$GCCLIB/crtbeginS.o" ] || [ ! -f "$GCCLIB/crtendS.o" ]; then
+	LIBGCC_BUILD="$WORK/build-gcc/$TARGET/libgcc"
+	[ -f "$LIBGCC_BUILD/Makefile" ] || {
+		echo "build-cross.sh: no libgcc build tree in $LIBGCC_BUILD to make crtbeginS.o in;" >&2
+		echo "  rm -rf $TC_PREFIX and run this again" >&2
+		exit 1
+	}
+	make -C "$LIBGCC_BUILD" MAKEINFO=true CRTSTUFF_T_CFLAGS_S=-fPIC crtbeginS.o crtendS.o
+	cp "$LIBGCC_BUILD/crtbeginS.o" "$LIBGCC_BUILD/crtendS.o" "$GCCLIB/"
+fi
+# libamixrt.so.1 links libgcc.a, so on a fresh build tools/build-compat.sh
+# above skipped it; this is the first point where it can be made.  The specs
+# name it for every `gcc -shared`, and nothing before here links one.
+[ -f "$TC_PREFIX/$TARGET/lib/amix_initS.o" ] && [ -f "$TC_PREFIX/$TARGET/lib/amixrt/libamixrt.so.1" ] \
+	|| "$REPO/tools/build-compat.sh"
+"$REPO/toolchain/install-specs.sh" >/dev/null
+
+# The runtime is linked into every program, so it has to run on every CPU in
+# the range: no 64-bit multiply/divide for the 68060, no 68040/060-only FPU
+# forms for the 68881/68882.  Checked on every run, not only after a build: a
+# prefix built by an earlier version of this script, --with-cpu=68060, passes
+# the test above (libstdc++.a present, amix-abi.h unchanged) and would
+# otherwise be kept.
+RUNTIME=("$GCCLIB"/libgcc.a "$GCCLIB"/crt*.o "$TC_PREFIX/$TARGET/lib"/lib{stdc++,stdc++exp,supc++,amixc99}.a "$TC_PREFIX/$TARGET/lib"/amix_init{,S}.o "$TC_PREFIX/$TARGET/lib/amixrt/libamixrt.so.1")
+python3 "$REPO/tools/check-68060-safe.py" --68881 "${RUNTIME[@]}" || {
+	echo "!! the runtime above is not safe on every 68020..68060 + 68881 machine." >&2
+	echo "!! If it was built by an older version of this script, rebuild it:" >&2
+	echo "!!   rm -rf $TC_PREFIX && toolchain/build-cross.sh" >&2
+	exit 1
+}
 
 echo
 echo "toolchain: $TC_PREFIX/bin/$TARGET-{gcc,g++}"

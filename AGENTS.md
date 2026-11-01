@@ -25,11 +25,13 @@ produces a **working binary that behaves wrongly** rather than a build error:
   strides by 16. It is set in the specs so it cannot be forgotten in one
   translation unit. The symptom when it is missing: `printf` works, `fprintf`
   writes nothing, and the program stops without a message.
-- **`--with-cpu=68060` is a correctness setting and must be the default.**
+- **`--with-cpu=m68020-60` is a correctness setting and must be the default.**
   libgcc's 64-bit divide built for a 68020 uses instructions the 68060 removed;
   without Motorola's ISP in the kernel they trap fatally. `CFLAGS_FOR_TARGET`
-  does not reach libgcc's own compile — measured. Code built this way still
-  runs on 68020/030/040, because it only ever avoids instructions.
+  does not reach libgcc's own compile — measured. Not `--with-cpu=68060`: that
+  also makes GCC use the 68040/060-only FPU forms (`fdmove`, `fsadd`...), and
+  the runtime then dies with SIGSYS on a 68030 + 68882.
+  `tools/check-68060-safe.py --68881` checks both.
 - **The target is `m68k-elf`, not `m68k-linux-gnu`.** The Debian m68k compiler
   looks like a shortcut: its `libgcc_eh.a` asks a dynamic loader
   (`_dl_find_object`) for exception tables and locks with pthreads, and AMIX has
@@ -54,6 +56,26 @@ produces a **working binary that behaves wrongly** rather than a build error:
   `-fpcc-struct-return`, the address goes in `%a1`". That was measured on
   Debian's `m68k-linux-gnu` compiler and is wrong for `m68k-elf` — a
   measurement belongs to the compiler it was taken with.
+- **binutils carries one patch: `toolchain/patches/`.** Unpatched m68k-elf
+  gas writes a `-fPIC` relocation against an exported symbol defined in the
+  same file as section+offset, so a shared library's pointer to its own
+  exported data cannot follow an executable's `R_68K_COPY` of it. A shared
+  xterm crashes on libXt's class records. `build-cross.sh` rebuilds binutils
+  when the patches change; `tools/test-pic-globals.sh` checks the result.
+- **A shared library takes what `libc.so.1` lacks from `libamixrt.so.1`.**
+  AMIX has `gettimeofday`, `select` and others only as non-PIC static members
+  of `usr/ccs/lib/libc.so`; `libamixrt` holds our own PIC versions plus
+  `libamixc99`, and `gcc -shared` links it `--as-needed`. It must define
+  nothing `libc.so.1` exports, have no `DT_INIT` and no `DT_NEEDED`, and keep
+  default visibility so a program's own copy wins. Add a function only when a
+  library needs it, with the rest of its libc group. `tools/test-amixrt.sh`
+  checks all of it; `docs/TOOLCHAIN.md` has the reasons.
+- **Every program carries the constructor runner, in `amix_init.o`, and
+  exports it.** It runs shared libraries' constructors after libc is
+  consistent, dependencies first, at start-up and, through the specs'
+  `--wrap=dlopen`, after each `dlopen`. It cannot move into a library: a
+  library reached only through another one, or opened with `dlopen`, must
+  still find it.
 - **The vendor's 1991 X archives need repairing before they can be linked.**
   Every object in `libX11.a` has `sh_link` on its `.rela` section pointing at
   itself; modern `ld` silently drops those relocations and the program jumps to

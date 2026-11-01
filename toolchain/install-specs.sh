@@ -61,18 +61,47 @@ def replace(section, value):
 # .init fragment that walks .init_array, which AMIX's 1991 crt1.o has never
 # heard of.  Without it NO C++ static constructor runs -- see
 # compat/amix_init.c for how a linker-script section rename causes that.
+#
+# -shared gets the shared-object set instead, as on any SVR4: no crt1.o and so
+# no _start, and the PIC builds of the rest.  crti.o and crtn.o still bracket
+# _init and _fini, which the linker records as DT_INIT and DT_FINI; AMIX's
+# runtime linker calls those when it loads the object and at exit.  It knows
+# nothing of .init_array, so amix_initS.o walks the arrays from there.  It is
+# an endfile, not a startfile: see compat/amix_init.c for why.
 replace("startfile",
-        "%{!shared:%{!nostdlib:%{!nostartfiles:%R/usr/ccs/lib/crt1.o %R/usr/ccs/lib/crti.o}}}"
-        " crtbegin.o%s %{!nostdlib:%{!nostartfiles:amix_init.o%s}}")
+        "%{!nostdlib:%{!nostartfiles:%{shared:%R/usr/ccs/lib/crti.o crtbeginS.o%s;"
+        ":%R/usr/ccs/lib/crt1.o %R/usr/ccs/lib/crti.o crtbegin.o%s amix_init.o%s}}}")
 replace("endfile",
-        "crtend.o%s %{!shared:%{!nostdlib:%{!nostartfiles:%R/usr/ccs/lib/crtn.o}}}")
+        "%{!nostdlib:%{!nostartfiles:%{shared:amix_initS.o%s crtendS.o%s %R/usr/ccs/lib/crtn.o;"
+        ":crtend.o%s %R/usr/ccs/lib/crtn.o}}}")
 # usr/ccs/lib holds libc.so, the link-time stub for the shared libc, and is not
 # on any default search path.
 # libamixc99 holds what SVR4.0's libc is missing -- snprintf, vsnprintf,
 # usleep, __cxa_atexit.  Named before -lc because it calls into libc and not
 # the other way round.
+#
+# A shared object links neither.  libc.so here is an archive -- the shared
+# libc.so.1 plus static members built without PIC, which cannot go into a
+# shared object -- and libc.so.1 is the runtime linker, so it is always loaded
+# anyway; a library must not NEED it, because the runtime linker knows it only
+# as /usr/lib/libc.so.1.  What a library needs that libc.so.1 does not export
+# comes from libamixrt.so.1 instead: libamixc99 built position-independent,
+# plus our own gettimeofday, select and the rest of the functions AMIX has only
+# as static members.  --as-needed records DT_NEEDED libamixrt.so.1 only in a
+# library that uses something from it.  It lives in a directory of its own,
+# which %:find-file locates next to the compiler, so the specs stay
+# relocatable.  libgcc is still linked: its members are hidden, and the
+# integer helpers are position-independent.
+#
+# A program still links -lamixc99 -lc statically for what it calls itself and
+# for what the libraries named on its command line need, and those copies win
+# at run time: ld exports them, and the runtime linker looks in the program
+# first.  libamixrt.so.1 serves the libraries the program reaches only through
+# another library's NEEDED, and those loaded with dlopen.
 replace("lib",
-        "%{!nostdlib:%{!nodefaultlibs:-L%R/usr/ccs/lib -L%R/usr/lib -lamixc99 -lc}}")
+        "%{!nostdlib:%{!nodefaultlibs:-L%R/usr/ccs/lib -L%R/usr/lib"
+        " %{shared:-L%:find-file(amixrt) --as-needed -lamixrt --no-as-needed;"
+        ":-lamixc99 -lc}}}")
 # The platform identifies itself.  A generic m68k-elf compiler defines nothing
 # that says "AMIX", so portable code has no way to select a path for this
 # target -- and code that IS written for it, like a crash handler that reads
@@ -130,13 +159,35 @@ replace("self_spec", "%{!mno-align-int:-malign-int} %{!mstrict-align:-mno-strict
 # Read off the machine's own /usr/bin/ls: libc.so.1 IS the runtime linker, text
 # starts at 0x80000000, and the hash table is the classic SysV one.  Nothing
 # AMIX ships carries a RELRO segment or a build-id note.
+#
+# A shared object has no interpreter and is linked at 0, as AMIX's own are.
+# -shared has to reach ld even with -nostdlib, or the output is an executable.
+# Name it with -Wl,-soname,libfoo.so.1.  --warn-textrel says when an object
+# built without -fPIC went in: AMIX loads such a library, but every process
+# then gets its own copy of the text.
+#
+# -rpath-link lets ld find libamixrt.so.1 when a library in the link NEEDs it,
+# directly or through another library: ld looks for a NEEDED library only
+# along -rpath-link, -rpath and its default directories, never along -L.
+#
+# --wrap=dlopen sends dlopen to compat/amix_dlopen.c (libamixc99 for a
+# program, libamixrt for a library), which has the constructors of what it
+# loads run dependencies first.  It is set wherever the library that provides
+# it is linked.  A program exports the constructor runner from amix_init.o
+# always, not only when a library in its link refers to it: a library it
+# opens with dlopen must find it too.
 replace("link",
-        "%{!nostdlib:--dynamic-linker /usr/lib/libc.so.1 -Ttext-segment=0x80000000"
-        " --hash-style=sysv -z norelro --build-id=none}")
+        "%{shared:-shared %{symbolic:-Bsymbolic} --hash-style=sysv -z norelro"
+        " --build-id=none --warn-textrel %{!nostdlib:%{!nodefaultlibs:--wrap=dlopen}};"
+        ":%{!nostdlib:--dynamic-linker /usr/lib/libc.so.1 -Ttext-segment=0x80000000"
+        " --hash-style=sysv -z norelro --build-id=none"
+        " %{!nodefaultlibs:--wrap=dlopen}"
+        " --export-dynamic-symbol=__amix_dso_init --export-dynamic-symbol=__amix_dso_batch}}"
+        " -rpath-link %:find-file(amixrt)")
 open(path, "w").write(text)
 PY
 
-mv "$SPECS.new" "$SPECS"
+mv "${SPECS:?}.new" "${SPECS:?}"
 echo "install-specs.sh: $SPECS"
 # The verification needs crtbegin.o/crtend.o, which libgcc provides.  During a
 # fresh toolchain build this script runs BEFORE libgcc exists -- the specs have
@@ -144,7 +195,7 @@ echo "install-specs.sh: $SPECS"
 # is expected then, not a failure.
 if [ -f "$LIBDIR/crtbegin.o" ]; then
 	echo "== a default link should now work and produce an AMIX executable"
-	TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+	TMP=$(mktemp -d); trap 'rm -rf "${TMP:?}"' EXIT
 	printf '#include <stdio.h>\nint main(void){printf("default specs work\\n");return 0;}\n' > "$TMP/t.c"
 	"$CC" $AMIX_CPU -O2 -o "$TMP/t" "$TMP/t.c"
 	file "$TMP/t"

@@ -37,7 +37,7 @@ possible:
 - **68060 code that does not trap.** That CPU dropped the 64-bit multiply and
   divide; a binary containing them dies on it unless the kernel emulates them.
   This compiler does not emit them, and `tools/check-68060-safe.py` verifies
-  any binary. Run it on every build, not once: one `%` on 64-bit operands
+  any binary (`--68881` adds the FPU forms a 68881/68882 lacks). Run it on every build, not once: one `%` on 64-bit operands
   brings the problem back.
 
 One measurement, for scale. The AMIX Quake port timed `timedemo demo1` on the
@@ -99,9 +99,16 @@ kernel; without one installed, they trap fatally. The symptom is that any
 64-bit division *by a variable* kills the process, while dividing by a constant
 is fine — because GCC folds that into a multiply and never calls libgcc at all.
 
-This is why the toolchain defaults to `--with-cpu=68060`. It has to be the
-default: `CFLAGS_FOR_TARGET` does not reach libgcc's own compile. Code built
-this way still runs on 68020/030/040, because it only ever avoids instructions.
+This is why the toolchain defaults to `--with-cpu=m68020-60`: the 68020
+instruction set and the 68881 FPU, tuned for the whole range, which keeps GCC
+off those forms. It has to be the default: `CFLAGS_FOR_TARGET` does not reach
+libgcc's own compile. The default used to be `--with-cpu=68060`, and that was
+wrong in the other direction: it made GCC use the FPU forms the 68040 and
+68060 added (`fdmove`, `fsadd`, `fdmul`...), which a 68881/68882 does not
+have, so a program that reached libgcc's floating-point helpers died with
+SIGSYS on a 68030. `tools/check-68060-safe.py --68881` checks for both, and
+`build-cross.sh` runs it on the installed runtime. `-m68060` is still there
+for code that will only ever run on a 68060.
 
 Anyone building m68k software for a 68060 without an ISP handler has the same
 problem, whatever their compiler.
@@ -125,7 +132,10 @@ problem, whatever their compiler.
   Mount or copy an AMIX filesystem and take those three trees across. X11 is
   not needed for C or C++ on its own; `tools/sync-sysroot.sh` adds it when you
   come to link X clients. Other AMIX cross-toolchain projects use this same
-  layout, so a sysroot assembled for one of those works here unchanged.
+  layout, so a sysroot assembled for one of those works here with one
+  addition: AMIX has no `stdint.h`, and GCC's own one includes the C
+  library's, so copy `compat/include/stdint.h` to `usr/include/stdint.h`
+  (`tools/sync-sysroot.sh` does this too).
 
 ```sh
 cp config.sh.example config.sh        # paths, CPU, this host's address
@@ -133,10 +143,10 @@ $EDITOR config.sh
 toolchain/build-cross.sh              # once, about 25 minutes
 ```
 
-`build-cross.sh` refuses to start if `$AMIX_SYSROOT/usr/include` is not there,
-so the sysroot has to exist first. It builds binutils and GCC, installs the
-specs and the repaired headers, builds the compat layer, and then libgcc and
-libstdc++.
+`build-cross.sh` refuses to start if `$AMIX_SYSROOT/usr/include` or its
+`stdint.h` is not there, so the sysroot has to exist first. It builds binutils
+and GCC, installs the specs and the repaired headers, builds the compat layer,
+and then libgcc and libstdc++.
 
 Two more steps, only if you are going to link X clients:
 
@@ -164,11 +174,19 @@ SVR4 offers. It is meant for a machine on a network you control.
 
 `probe/` is the test battery, and it is how every fact in `docs/TOOLCHAIN.md`
 was established. Each program asks one question and prints the answer, flushed,
-in an order where a crash names the step it died in. Two of them
-(`probe/compat.c`, `probe/stl.cpp`) also run natively via
+in an order where a crash names the step it died in. Some of them
+(`probe/compat.c`, `probe/cxa.c`, `probe/stl.cpp`) also run natively via
 `tools/test-compat-host.sh` — not redundancy: the formatter's battery passed on
 the host and died on the Amiga, and that difference is what localised the CPU
 fault.
+
+`tools/test-shared.sh` builds two shared libraries and two programs that use
+them, checks them with `readelf` on the host, and stages them for a run on the
+machine. `tools/test-shared-indirect.sh`, `tools/test-pic-globals.sh` and
+`tools/test-amixrt.sh` do the same for a library reached through another
+library, for a library's pointers to its own data, and for `libamixrt.so.1`;
+[`docs/shared-library-tests.md`](docs/shared-library-tests.md) says how to run
+them on the machine and what to expect.
 
 ## Status
 
@@ -176,6 +194,10 @@ Working: C and C++ compilation and linking, `libgcc`, `libsupc++`, a **hosted**
 `libstdc++` with the standard containers, exceptions, RTTI, and the compat
 layer (`snprintf`, `vsnprintf`, `usleep`, `stdint.h`, C++ linkage wrappers for
 AMIX's C headers). `probe/stl.cpp` is the acceptance test and it passes.
+Shared libraries build with `gcc -shared -fPIC`, constructors included; see
+`docs/TOOLCHAIN.md` for what they may and may not do. What they need and
+`libc.so.1` does not export comes from `libamixrt.so.1`, built with the
+toolchain; it has to be in `/usr/lib` on the machine that runs them.
 
 Known and unfixed: `fprintf` reaches AMIX's own formatter, which predates C99
 and mis-handles `ll` conversions -- the compat layer replaces `snprintf` and
@@ -188,11 +210,15 @@ and mis-handles `ll` conversions -- the compat layer replaces `snprintf` and
 
 Permissive rather than copyleft for one concrete reason: `compat/` is a
 *runtime* library. `libamixc99.a` and `amix_init.o` are linked into every
-binary this toolchain produces, so a copyleft licence here would reach into
+binary this toolchain produces, and `libamixrt.so.1` is loaded by every shared
+library that needs it, so a copyleft licence here would reach into
 other people's ports of other people's software. GCC solves the same problem
 with a separate runtime-library exception; MIT is the simpler way to the same
 place.
 
 GCC and binutils are downloaded from ftp.gnu.org at build time and carry their
 own licences; they are not redistributed here. Nothing from AMIX is
-redistributed here either — see **What you need**.
+redistributed here either — see **What you need**. One thing from it does go
+into a build product: `libamixrt.so.1` carries libc's error and signal message
+tables, which `tools/gen-amixrt-tables.py` copies from your sysroot when the
+library is built, so that they read exactly as `strerror` does.

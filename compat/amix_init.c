@@ -25,7 +25,17 @@
  * separate object named in the compiler's specs rather than a member of
  * libamixc99: a library member is pulled in only when something references it,
  * and nothing references a constructor.
+ *
+ * SHARED OBJECTS need the same walk, from DT_INIT and DT_FINI: AMIX's runtime
+ * linker calls those for every object it loads, and has never heard of
+ * DT_INIT_ARRAY either.  The same file built with -fPIC is amix_initS.o, which
+ * the specs link into `gcc -shared` output instead -- see the second half.
+ * The program's copy also holds the runner that libraries hand their walks to,
+ * so that they run once libc is consistent -- see "Shared libraries'
+ * constructors" below.
  */
+
+#ifndef __PIC__
 
 /* Provided by the linker script, and weak so this still links if a future
  * script stops emitting them. */
@@ -56,6 +66,96 @@ void __amix_run_fini_array(void)
 	}
 }
 
+/* Shared libraries' constructors, run once the program has started.
+ *
+ * AMIX's runtime linker calls each library's DT_INIT from _rtld, before it
+ * returns to the program's _start -- and before _rt_setup calls _rt_setaddr,
+ * which points 25 of libc.so.1's own references at the program's copies:
+ * __iob and the stdio buffers, errno, _environ, _fp_hw, __ctype, the timezone
+ * variables, and malloc, free, calloc and realloc.  Until then libc works on
+ * its own copies while the library already uses the program's.  A
+ * constructor's printf fills libc's private stdout, its fflush flushes the
+ * program's, and the text is never written -- measured on a 68030 and a
+ * 68060.  getenv finds nothing either: crt1.o has not set _environ yet.
+ *
+ * So a library's DT_INIT (amix_initS.o, below) does not run its .init_array:
+ * it hands it to __amix_dso_init, which the program's start-up runs from its
+ * .init_array at priority 100 -- after libc is consistent and _environ is
+ * set, after libstdc++'s standard streams (priority 90), before the
+ * program's own constructors.  A library loaded later, by dlopen, runs when
+ * the dlopen returns (__amix_dso_batch, below).
+ *
+ * Last in, first out.  The runtime linker loads objects breadth first and
+ * calls their DT_INIT in load order, so a library comes before the libraries
+ * it NEEDs: libXmu before libXt.  Running the list backwards initialises a
+ * library's dependencies before the library, as an ELF system does.
+ *
+ * It lives in this startfile, linked into every program, rather than in
+ * libamixc99: a library the program reaches only through another library's
+ * NEEDED must still find it, and ld searches archives before it reads such a
+ * library.  The specs export __amix_dso_init and __amix_dso_batch from every
+ * program, so a library opened with dlopen by a program that links none of
+ * ours finds them too.  A program that uses no shared library of ours carries
+ * these few bytes and never calls them. */
+
+/* Priorities up to 100 are reserved for the implementation, which this is. */
+#pragma GCC diagnostic ignored "-Wprio-ctor-dtor"
+
+struct amix_dso_init {
+	struct amix_dso_init *next;
+	void (*run)(void);
+};
+
+static struct amix_dso_init *amix_dso_list;
+static int amix_dso_started;
+static int amix_dso_batching;
+
+/* Run the walks registered since mark, newest first.  A walk may open more
+ * libraries; their walks are pushed above it and run, and taken off the list,
+ * before this loop sees the list again, so it only ever takes its own. */
+static void amix_dso_drain(struct amix_dso_init *mark)
+{
+	struct amix_dso_init *d;
+
+	while ((d = amix_dso_list) != 0 && d != mark) {
+		amix_dso_list = d->next;
+		d->run();
+	}
+}
+
+void __amix_dso_init(struct amix_dso_init *d)
+{
+	if (amix_dso_started && amix_dso_batching == 0) {
+		d->run();
+		return;
+	}
+	d->next = amix_dso_list;
+	amix_dso_list = d;
+}
+
+/* dlopen, as the specs rename it (--wrap=dlopen; amix_dlopen.c), brackets the
+ * runtime linker's _dlopen with this.  _dlopen calls the DT_INITs of what it
+ * loads in its own load order, the opened library before the libraries it
+ * NEEDs, so each walk is only queued while it runs, and the queue is run
+ * afterwards newest first: dependencies before the libraries that need them,
+ * as at start-up.  begin returns a mark for end; calls nest. */
+struct amix_dso_init *__amix_dso_batch(struct amix_dso_init *mark, int begin)
+{
+	if (begin) {
+		amix_dso_batching++;
+		return amix_dso_list;
+	}
+	amix_dso_batching--;
+	amix_dso_drain(mark);
+	return 0;
+}
+
+__attribute__((constructor(100))) static void amix_dso_run(void)
+{
+	amix_dso_started = 1;
+	amix_dso_drain(0);
+}
+
 /* The fragments themselves.  crti.o opens _init and _fini, crtn.o closes them,
  * and everything linked between contributes its body -- which is why this has
  * to sit inside that window and why the specs decide where. */
@@ -66,3 +166,102 @@ __asm__(
 	"	jsr __amix_run_fini_array\n"
 	"	.text\n"
 );
+
+#else /* __PIC__: amix_initS.o, for shared objects */
+
+/* Four things differ from the executable's copy above.
+ *
+ * The linker script for -shared defines no __init_array_start and friends: a
+ * modern dynamic linker reads DT_INIT_ARRAY instead, so nothing needed them.
+ * This object brackets the arrays itself.  It is an endfile, linked after every
+ * object and library, so its end labels in plain .init_array and .fini_array
+ * land after everyone else's entries.  Its start labels go in .init_array.0 and
+ * .fini_array.0, which the script's SORT_BY_INIT_PRIORITY places ahead of every
+ * other entry: priority 0 is reserved, and nothing else uses it.  Each start
+ * label carries a null entry, which the walk skips.  Without it an object with
+ * no constructors would have an empty .init_array, and ld warns about that on
+ * every link.
+ *
+ * Every symbol is hidden, so each shared object walks its own arrays and
+ * exports nothing that could take the place of the executable's copy.
+ *
+ * The calls from the .init and .fini fragments are PC-relative, so the text
+ * needs no relocation at load time.
+ *
+ * The walk does not run from DT_INIT itself.  AMIX's runtime linker calls
+ * DT_INIT before libc.so.1 is consistent with the program -- stdio, errno,
+ * _environ and malloc among others are rebound only afterwards -- so the
+ * .init fragment hands the walk to __amix_dso_init in the program, which runs
+ * it during the program's start-up; the first half of this file has the
+ * details.  The reference is weak.  A program linked by something else has no
+ * __amix_dso_init; the runtime linker resolves the weak reference to 0, and
+ * the library runs its own array at once, which is the best that can be done
+ * there.  Every program built here exports it.
+ *
+ * Being an endfile still puts the .init fragment after crtbeginS.o's, the same
+ * order as in an executable. */
+#define AMIX_HIDDEN __attribute__((visibility("hidden")))
+
+extern void (*__amix_init_array_start[])(void) AMIX_HIDDEN;
+extern void (*__amix_init_array_end[])(void) AMIX_HIDDEN;
+extern void (*__amix_fini_array_start[])(void) AMIX_HIDDEN;
+extern void (*__amix_fini_array_end[])(void) AMIX_HIDDEN;
+
+AMIX_HIDDEN void __amix_run_init_array(void)
+{
+	void (**p)(void);
+
+	for (p = __amix_init_array_start; p < __amix_init_array_end; p++) {
+		if (*p != 0) (**p)();
+	}
+}
+
+struct amix_dso_init {
+	struct amix_dso_init *next;
+	void (*run)(void);
+};
+
+/* In the program: amix_init.o, above. */
+extern void __amix_dso_init(struct amix_dso_init *) __attribute__((weak));
+
+static struct amix_dso_init amix_this_object = { 0, __amix_run_init_array };
+
+AMIX_HIDDEN void __amix_defer_init_array(void)
+{
+	if (__amix_dso_init != 0) __amix_dso_init(&amix_this_object);
+	else __amix_run_init_array();
+}
+
+AMIX_HIDDEN void __amix_run_fini_array(void)
+{
+	void (**p)(void);
+
+	/* Reverse order, as destruction should be. */
+	for (p = __amix_fini_array_end; p > __amix_fini_array_start; ) {
+		p--;
+		if (*p != 0) (**p)();
+	}
+}
+
+#define AMIX_LABEL(sec, name) \
+	"	.section " sec ",\"aw\"\n" \
+	"	.p2align 2\n" \
+	"	.globl " name "\n" \
+	"	.hidden " name "\n" \
+	name ":\n"
+
+__asm__(
+	AMIX_LABEL(".init_array.0", "__amix_init_array_start")
+	"	.long 0\n"
+	AMIX_LABEL(".init_array", "__amix_init_array_end")
+	AMIX_LABEL(".fini_array.0", "__amix_fini_array_start")
+	"	.long 0\n"
+	AMIX_LABEL(".fini_array", "__amix_fini_array_end")
+	"	.section .init,\"ax\",@progbits\n"
+	"	bsr.l __amix_defer_init_array\n"
+	"	.section .fini,\"ax\",@progbits\n"
+	"	bsr.l __amix_run_fini_array\n"
+	"	.text\n"
+);
+
+#endif /* __PIC__ */
